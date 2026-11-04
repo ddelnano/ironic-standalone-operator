@@ -2454,3 +2454,120 @@ func TestGatewayIPWithExtraRanges(t *testing.T) {
 	}
 	assert.Equal(t, "10.0.0.1", gotEnv)
 }
+
+func TestNetworkBootURLEnvVars(t *testing.T) {
+	testCases := []struct {
+		name               string
+		networking         metal3api.Networking
+		tlsCertificateName string
+		expectedHTTPURL    string
+		expectedBaseURL    string
+	}{
+		{
+			name: "host networking keeps the image defaults",
+			networking: metal3api.Networking{
+				ExternalIP: "192.0.2.10",
+			},
+		},
+		{
+			name: "no host networking without external IP keeps the image defaults",
+			networking: metal3api.Networking{
+				DisableHostNetwork: true,
+			},
+		},
+		{
+			name: "no host networking with external IP",
+			networking: metal3api.Networking{
+				DisableHostNetwork: true,
+				ExternalIP:         "192.0.2.10",
+			},
+			expectedHTTPURL: "http://192.0.2.10:6180",
+			expectedBaseURL: "http://192.0.2.10:6385",
+		},
+		{
+			name: "no host networking with external IP and TLS",
+			networking: metal3api.Networking{
+				DisableHostNetwork: true,
+				ExternalIP:         "192.0.2.10",
+			},
+			tlsCertificateName: "my-tls",
+			expectedHTTPURL:    "http://192.0.2.10:6180",
+			expectedBaseURL:    "https://192.0.2.10:6385",
+		},
+		{
+			name: "no host networking with external IP and custom ports",
+			networking: metal3api.Networking{
+				DisableHostNetwork: true,
+				ExternalIP:         "192.0.2.10",
+				APIPort:            6388,
+				ImageServerPort:    8080,
+			},
+			expectedHTTPURL: "http://192.0.2.10:8080",
+			expectedBaseURL: "http://192.0.2.10:6388",
+		},
+		{
+			name: "no host networking with IPv6 external IP",
+			networking: metal3api.Networking{
+				DisableHostNetwork: true,
+				ExternalIP:         "2001:db8::10",
+			},
+			expectedHTTPURL: "http://[2001:db8::10]:6180",
+			expectedBaseURL: "http://[2001:db8::10]:6385",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			cctx := ControllerContext{}
+			secret := &corev1.Secret{
+				Data: map[string][]byte{
+					"htpasswd": []byte("abcd"),
+				},
+			}
+			ironic := &metal3api.Ironic{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "test",
+				},
+				Spec: metal3api.IronicSpec{
+					Networking: tc.networking,
+					TLS: metal3api.TLS{
+						CertificateName: tc.tlsCertificateName,
+					},
+				},
+			}
+
+			resources := Resources{Ironic: ironic, APISecret: secret}
+			podTemplate, err := newIronicPodTemplate(cctx, resources)
+			require.NoError(t, err)
+
+			// Both containers need the URLs: ironic renders them into its configuration
+			// and httpd into the iPXE scripts it serves.
+			for _, containerName := range []string{ironicContainerName, httpdContainerName} {
+				var container *corev1.Container
+				for i := range podTemplate.Spec.Containers {
+					if podTemplate.Spec.Containers[i].Name == containerName {
+						container = &podTemplate.Spec.Containers[i]
+						break
+					}
+				}
+				require.NotNil(t, container, "%s container should exist", containerName)
+
+				envMap := make(map[string]string)
+				for _, env := range container.Env {
+					envMap[env.Name] = env.Value
+				}
+
+				httpURL, hasHTTPURL := envMap["IRONIC_HTTP_URL"]
+				baseURL, hasBaseURL := envMap["IRONIC_BASE_URL"]
+				if tc.expectedHTTPURL == "" {
+					assert.False(t, hasHTTPURL, "IRONIC_HTTP_URL should not be set on %s", containerName)
+					assert.False(t, hasBaseURL, "IRONIC_BASE_URL should not be set on %s", containerName)
+					continue
+				}
+				assert.Equal(t, tc.expectedHTTPURL, httpURL, "IRONIC_HTTP_URL mismatch on %s", containerName)
+				assert.Equal(t, tc.expectedBaseURL, baseURL, "IRONIC_BASE_URL mismatch on %s", containerName)
+			}
+		})
+	}
+}

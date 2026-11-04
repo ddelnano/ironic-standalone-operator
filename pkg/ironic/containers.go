@@ -112,6 +112,8 @@ func buildCommonEnvVars(ironic *metal3api.Ironic) []corev1.EnvVar {
 		)
 	}
 
+	result = append(result, buildNetworkBootURLEnvVars(ironic)...)
+
 	if ironic.Spec.TLS.CertificateName != "" {
 		// Ironic will listen on a Unix socket, httpd will be responsible for serving HTTPS.
 		result = append(result, []corev1.EnvVar{
@@ -179,6 +181,38 @@ func appendAgentImageEnvVars(envVars []corev1.EnvVar, images []metal3api.AgentIm
 	envVars = appendStringEnv(envVars, "DEPLOY_KERNEL_BY_ARCH", strings.Join(kernelByArch, ","))
 	envVars = appendStringEnv(envVars, "DEPLOY_RAMDISK_BY_ARCH", strings.Join(ramdiskByArch, ","))
 	return envVars
+}
+
+// buildNetworkBootURLEnvVars overrides the URLs that network boot hands to the
+// hosts being provisioned: the image server URL used for the per-node iPXE
+// configurations and the IPA kernel/ramdisk, and the API URL that IPA calls
+// back to. The image derives both from the IP Ironic listens on, which is the
+// pod IP when host networking is disabled and thus not reachable from outside
+// the cluster. Virtual media is not affected: it uses the separate external
+// URLs that the image derives from IRONIC_EXTERNAL_IP.
+func buildNetworkBootURLEnvVars(ironic *metal3api.Ironic) []corev1.EnvVar {
+	networking := ironic.Spec.Networking
+	if !networking.DisableHostNetwork || networking.ExternalIP == "" {
+		return nil
+	}
+
+	// httpd serves the API over HTTPS when a certificate is provided, while
+	// the image server port always stays plain HTTP.
+	apiScheme := "http"
+	if ironic.Spec.TLS.CertificateName != "" {
+		apiScheme = "https"
+	}
+
+	return []corev1.EnvVar{
+		{
+			Name:  "IRONIC_HTTP_URL",
+			Value: "http://" + net.JoinHostPort(networking.ExternalIP, strconv.Itoa(int(networking.ImageServerPort))),
+		},
+		{
+			Name:  "IRONIC_BASE_URL",
+			Value: apiScheme + "://" + net.JoinHostPort(networking.ExternalIP, strconv.Itoa(int(networking.APIPort))),
+		},
+	}
 }
 
 func buildExtraConfigVars(ironic *metal3api.Ironic) []corev1.EnvVar {
